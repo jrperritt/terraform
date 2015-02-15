@@ -12,6 +12,7 @@ import (
 	"github.com/racker/perigee"
 	"github.com/rackspace/gophercloud"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/bootfromvolume"
+	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/floatingip"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/keypairs"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/secgroups"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/volumeattach"
@@ -275,18 +276,24 @@ func resourceComputeInstanceV2Create(d *schema.ResourceData, meta interface{}) e
 	}
 	floatingIP := d.Get("floating_ip").(string)
 	if floatingIP != "" {
+		// first try connecting to the Neutron service
+		// and associating the ip using the Neutron API
 		networkingClient, err := config.networkingV2Client(d.Get("region").(string))
-		if err != nil {
-			return fmt.Errorf("Error creating OpenStack compute client: %s", err)
-		}
-
-		allFloatingIPs, err := getFloatingIPs(networkingClient)
-		if err != nil {
-			return fmt.Errorf("Error listing OpenStack floating IPs: %s", err)
-		}
-		err = assignFloatingIP(networkingClient, extractFloatingIPFromIP(allFloatingIPs, floatingIP), server.ID)
-		if err != nil {
-			fmt.Errorf("Error assigning floating IP to OpenStack compute instance: %s", err)
+		if err == nil {
+			allFloatingIPs, err := getFloatingIPs(networkingClient)
+			if err != nil {
+				return fmt.Errorf("Error listing OpenStack floating IPs: %s", err)
+			}
+			err = assignFloatingIP(networkingClient, extractFloatingIPFromIP(allFloatingIPs, floatingIP), server.ID)
+			if err != nil {
+				fmt.Errorf("Error assigning floating IP to OpenStack compute instance: %s", err)
+			}
+		} else {
+			// if that fails, just try associating the ip using the nova api
+			log.Printf("[INFO] Unable to connect to the Network service. Falling back to Nova API")
+			if err := floatingip.Associate(computeClient, server.ID, floatingIP).ExtractErr(); err != nil {
+				return fmt.Errorf("Unable to associate the floating IP using either Neutron or Nova: %s", err)
+			}
 		}
 	}
 
@@ -540,18 +547,36 @@ func resourceComputeInstanceV2Update(d *schema.ResourceData, meta interface{}) e
 	if d.HasChange("floating_ip") {
 		floatingIP := d.Get("floating_ip").(string)
 		if floatingIP != "" {
+			// first try connecting to the Neutron service
+			// and using the Neutron API to make the floating IP changes
 			networkingClient, err := config.networkingV2Client(d.Get("region").(string))
-			if err != nil {
-				return fmt.Errorf("Error creating OpenStack compute client: %s", err)
-			}
-
-			allFloatingIPs, err := getFloatingIPs(networkingClient)
-			if err != nil {
-				return fmt.Errorf("Error listing OpenStack floating IPs: %s", err)
-			}
-			err = assignFloatingIP(networkingClient, extractFloatingIPFromIP(allFloatingIPs, floatingIP), d.Id())
-			if err != nil {
-				fmt.Errorf("Error assigning floating IP to OpenStack compute instance: %s", err)
+			if err == nil {
+				allFloatingIPs, err := getFloatingIPs(networkingClient)
+				if err != nil {
+					return fmt.Errorf("Error listing OpenStack floating IPs: %s", err)
+				}
+				err = assignFloatingIP(networkingClient, extractFloatingIPFromIP(allFloatingIPs, floatingIP), d.Id())
+				if err != nil {
+					fmt.Errorf("Error assigning floating IP to OpenStack compute instance: %s", err)
+				}
+			} else {
+				// if connecting to Neutron fails, fall back to the Nova API
+				// do an explicit disassociate and associate of the modified IP
+				oldFIP, newFIP := d.GetChange("floating_ip")
+				log.Printf("[DEBUG] Old Floating IP: %v", oldFIP)
+				log.Printf("[DEBUG] New Floating IP: %v", newFIP)
+				if oldFIP.(string) != "" {
+					log.Printf("[DEBUG] Attemping to disassociate %s from %s", oldFIP, d.Id())
+					if err := floatingip.Disassociate(computeClient, d.Id(), oldFIP.(string)).ExtractErr(); err != nil {
+						return fmt.Errorf("Error disassociating Floating IP during update: %s", err)
+					}
+				}
+				if newFIP.(string) != "" {
+					log.Printf("[DEBUG] Attemping to associate %s to %s", newFIP, d.Id())
+					if err := floatingip.Associate(computeClient, d.Id(), newFIP.(string)).ExtractErr(); err != nil {
+						return fmt.Errorf("Error associating Floating IP during update: %s", err)
+					}
+				}
 			}
 		}
 	}
