@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/rackspace/gophercloud"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/bootfromvolume"
+	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/floatingip"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/keypairs"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/secgroups"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/volumeattach"
@@ -106,6 +107,12 @@ func resourceComputeInstanceV2() *schema.Resource {
 						},
 					},
 				},
+			},
+			"network_service": &schema.Schema{
+				Type:     schema.TypeString,
+				Required: true,
+				ForceNew: true,
+				Default:  "neutron",
 			},
 			"metadata": &schema.Schema{
 				Type:     schema.TypeMap,
@@ -274,18 +281,29 @@ func resourceComputeInstanceV2Create(d *schema.ResourceData, meta interface{}) e
 	}
 	floatingIP := d.Get("floating_ip").(string)
 	if floatingIP != "" {
-		networkingClient, err := config.networkingV2Client(d.Get("region").(string))
-		if err != nil {
-			return fmt.Errorf("Error creating OpenStack compute client: %s", err)
-		}
+		networkService := d.Get("network_service").(string)
+		if networkService == "neutron" {
+			log.Printf("[DEBUG] Using Neutron to configure the floating IP")
+			networkingClient, err := config.networkingV2Client(d.Get("region").(string))
+			if err != nil {
+				return fmt.Errorf("Error creating OpenStack compute client: %s", err)
+			}
 
-		allFloatingIPs, err := getFloatingIPs(networkingClient)
-		if err != nil {
-			return fmt.Errorf("Error listing OpenStack floating IPs: %s", err)
-		}
-		err = assignFloatingIP(networkingClient, extractFloatingIPFromIP(allFloatingIPs, floatingIP), server.ID)
-		if err != nil {
-			fmt.Errorf("Error assigning floating IP to OpenStack compute instance: %s", err)
+			allFloatingIPs, err := getFloatingIPs(networkingClient)
+			if err != nil {
+				return fmt.Errorf("Error listing OpenStack floating IPs: %s", err)
+			}
+			err = assignFloatingIP(networkingClient, extractFloatingIPFromIP(allFloatingIPs, floatingIP), server.ID)
+			if err != nil {
+				fmt.Errorf("Error assigning floating IP to OpenStack compute instance: %s", err)
+			}
+		} else if networkService == "nova-network" {
+			log.Printf("[DEBUG] Using nova-network to configure the floating IP")
+			if err := floatingip.Associate(computeClient, server.ID, floatingIP).ExtractErr(); err != nil {
+				return fmt.Errorf("Unable to associate the floating IP using either Neutron or Nova: %s", err)
+			}
+		} else {
+			log.Printf("[INFO] Unknown network service specified (%s). Skipping floating IP configuration.", networkService)
 		}
 	}
 
@@ -539,18 +557,41 @@ func resourceComputeInstanceV2Update(d *schema.ResourceData, meta interface{}) e
 	if d.HasChange("floating_ip") {
 		floatingIP := d.Get("floating_ip").(string)
 		if floatingIP != "" {
-			networkingClient, err := config.networkingV2Client(d.Get("region").(string))
-			if err != nil {
-				return fmt.Errorf("Error creating OpenStack compute client: %s", err)
-			}
+			networkService := d.Get("network_service").(string)
+			if networkService == "neutron" {
+				log.Printf("[DEBUG] Using Neutron to configure the floating IP")
+				networkingClient, err := config.networkingV2Client(d.Get("region").(string))
+				if err != nil {
+					return fmt.Errorf("Error creating OpenStack compute client: %s", err)
+				}
 
-			allFloatingIPs, err := getFloatingIPs(networkingClient)
-			if err != nil {
-				return fmt.Errorf("Error listing OpenStack floating IPs: %s", err)
-			}
-			err = assignFloatingIP(networkingClient, extractFloatingIPFromIP(allFloatingIPs, floatingIP), d.Id())
-			if err != nil {
-				fmt.Errorf("Error assigning floating IP to OpenStack compute instance: %s", err)
+				allFloatingIPs, err := getFloatingIPs(networkingClient)
+				if err != nil {
+					return fmt.Errorf("Error listing OpenStack floating IPs: %s", err)
+				}
+				err = assignFloatingIP(networkingClient, extractFloatingIPFromIP(allFloatingIPs, floatingIP), d.Id())
+				if err != nil {
+					fmt.Errorf("Error assigning floating IP to OpenStack compute instance: %s", err)
+				}
+			} else if networkService == "nova-network" {
+				log.Printf("[DEBUG] Using nova-network to configure the floating IP")
+				oldFIP, newFIP := d.GetChange("floating_ip")
+				log.Printf("[DEBUG] Old Floating IP: %v", oldFIP)
+				log.Printf("[DEBUG] New Floating IP: %v", newFIP)
+				if oldFIP.(string) != "" {
+					log.Printf("[DEBUG] Attemping to disassociate %s from %s", oldFIP, d.Id())
+					if err := floatingip.Disassociate(computeClient, d.Id(), oldFIP.(string)).ExtractErr(); err != nil {
+						return fmt.Errorf("Error disassociating Floating IP during update: %s", err)
+					}
+				}
+				if newFIP.(string) != "" {
+					log.Printf("[DEBUG] Attemping to associate %s to %s", newFIP, d.Id())
+					if err := floatingip.Associate(computeClient, d.Id(), newFIP.(string)).ExtractErr(); err != nil {
+						return fmt.Errorf("Error associating Floating IP during update: %s", err)
+					}
+				}
+			} else {
+				log.Printf("[DEBUG] Unknown network service specified (%s). Skipping floating IP configuration.", networkService)
 			}
 		}
 	}
