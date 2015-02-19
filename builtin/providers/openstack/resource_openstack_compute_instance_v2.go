@@ -18,7 +18,6 @@ import (
 	"github.com/rackspace/gophercloud/openstack/compute/v2/images"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/servers"
 	"github.com/rackspace/gophercloud/openstack/networking/v2/extensions/layer3/floatingips"
-	"github.com/rackspace/gophercloud/openstack/networking/v2/networks"
 	"github.com/rackspace/gophercloud/openstack/networking/v2/ports"
 	"github.com/rackspace/gophercloud/pagination"
 )
@@ -318,6 +317,22 @@ func resourceComputeInstanceV2Read(d *schema.ResourceData, meta interface{}) err
 
 	hostv4 := server.AccessIPv4
 	if hostv4 == "" {
+		// first look for a floating IP address
+		// it's possible that more than one floating IP address can be used
+		// on multiple networks, but we'll just go with the first one found.
+		for _, networkAddresses := range server.Addresses {
+			for _, element := range networkAddresses.([]interface{}) {
+				address := element.(map[string]interface{})
+				if address["OS-EXT-IPS:type"] == "floating" {
+					hostv4 = address["addr"].(string)
+					break
+				}
+			}
+		}
+	}
+
+	// if that didn't pan out, just try to find the first IP
+	if hostv4 == "" {
 		for _, networkAddresses := range server.Addresses {
 			for _, element := range networkAddresses.([]interface{}) {
 				address := element.(map[string]interface{})
@@ -331,6 +346,7 @@ func resourceComputeInstanceV2Read(d *schema.ResourceData, meta interface{}) err
 	d.Set("access_ip_v4", hostv4)
 	log.Printf("hostv4: %s", hostv4)
 
+	// floating ipv6 addresses don't exist, so just find the first available v6 address
 	hostv6 := server.AccessIPv6
 	if hostv6 == "" {
 		for _, networkAddresses := range server.Addresses {
