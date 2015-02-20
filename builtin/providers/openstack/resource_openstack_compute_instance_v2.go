@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/rackspace/gophercloud"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/bootfromvolume"
+	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/floatingip"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/keypairs"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/secgroups"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/volumeattach"
@@ -80,6 +81,12 @@ func resourceComputeInstanceV2() *schema.Resource {
 				Type:     schema.TypeString,
 				Optional: true,
 				ForceNew: true,
+			},
+			"network_service": &schema.Schema{
+				Type:        schema.TypeString,
+				Optional:    true,
+				ForceNew:    true,
+				DefaultFunc: envDefaultNetworkServiceFunc("OS_NETWORK_SERVICE"),
 			},
 			"network": &schema.Schema{
 				Type:     schema.TypeList,
@@ -298,17 +305,35 @@ func resourceComputeInstanceV2Create(d *schema.ResourceData, meta interface{}) e
 
 	// if a floating IP was specified, associate it to the instance
 	rawNetworks := d.Get("network").([]interface{})
-	networkingClient, err := config.networkingV2Client(d.Get("region").(string))
-	if err != nil {
-		return nil
-	}
-	for _, raw := range rawNetworks {
-		rawMap := raw.(map[string]interface{})
-		if rawMap["floating_ip"].(string) != "" {
-			if err := associateFloatingIPNeutron(networkingClient, d.Id(), rawMap["uuid"].(string), rawMap["floating_ip"].(string)); err != nil {
-				return err
+
+	network_service := d.Get("network_service").(string)
+	switch network_service {
+	case "neutron":
+		networkingClient, err := config.networkingV2Client(d.Get("region").(string))
+		if err != nil {
+			return err
+		}
+		for _, raw := range rawNetworks {
+			rawMap := raw.(map[string]interface{})
+			if rawMap["floating_ip"].(string) != "" {
+				log.Printf("[DEBUG] Attemping to associate %v to %v", rawMap["floating_ip"], d.Id())
+				if err := associateFloatingIPNeutron(networkingClient, d.Id(), rawMap["uuid"].(string), rawMap["floating_ip"].(string)); err != nil {
+					return err
+				}
 			}
 		}
+	case "nova-network":
+		for _, raw := range rawNetworks {
+			rawMap := raw.(map[string]interface{})
+			if rawMap["floating_ip"].(string) != "" {
+				log.Printf("[DEBUG] Attemping to associate %v to %v", rawMap["floating_ip"], d.Id())
+				if err := associateFloatingIPNova(computeClient, d.Id(), rawMap["floating_ip"].(string)); err != nil {
+					return err
+				}
+			}
+		}
+	default:
+		return fmt.Errorf("Unsupported network service: %v", network_service)
 	}
 
 	// were volume attachments specified?
@@ -379,16 +404,17 @@ func resourceComputeInstanceV2Read(d *schema.ResourceData, meta interface{}) err
 				if floatingIP == "" {
 					floatingIP = address["addr"].(string)
 				}
+			}
+			if address["version"].(float64) == 4 {
+				addresses[n]["fixed_ip_v4"] = address["addr"].(string)
 			} else {
-				if address["version"].(float64) == 4 {
-					addresses[n]["fixed_ip_v4"] = address["addr"].(string)
-				} else {
-					addresses[n]["fixed_ip_v6"] = fmt.Sprintf("[%s]", address["addr"].(string))
-				}
+				addresses[n]["fixed_ip_v6"] = fmt.Sprintf("[%s]", address["addr"].(string))
 			}
 			addresses[n]["mac"] = address["OS-EXT-IPS-MAC:mac_addr"].(string)
 		}
 	}
+
+	log.Printf("[DEBUG] Addresses: %v", addresses)
 
 	// if a floating IP was found above, use it
 	if floatingIP != "" {
@@ -581,33 +607,67 @@ func resourceComputeInstanceV2Update(d *schema.ResourceData, meta interface{}) e
 	}
 
 	if d.HasChange("network") {
-		networkingClient, err := config.networkingV2Client(d.Get("region").(string))
-		if err != nil {
-			return nil
-		}
 		log.Printf("[DEBUG] Detected network change.")
 		oldNets, newNets := d.GetChange("network")
-		// first disassociate
-		rawNetworks := oldNets.([]interface{})
-		for _, raw := range rawNetworks {
-			rawMap := raw.(map[string]interface{})
-			if rawMap["floating_ip"].(string) != "" {
-				if err := disassociateFloatingIPNeutron(networkingClient, d.Id(), rawMap["uuid"].(string), rawMap["floating_ip"].(string)); err != nil {
-					return err
+
+		network_service := d.Get("network_service").(string)
+		switch network_service {
+		case "neutron":
+			networkingClient, err := config.networkingV2Client(d.Get("region").(string))
+			if err != nil {
+				return nil
+			}
+			// first disassociate
+			rawNetworks := oldNets.([]interface{})
+			for _, raw := range rawNetworks {
+				rawMap := raw.(map[string]interface{})
+				if rawMap["floating_ip"].(string) != "" {
+					log.Printf("[DEBUG] Attemping to disassociate %v from %v", rawMap["floating_ip"], d.Id())
+					if err := disassociateFloatingIPNeutron(networkingClient, d.Id(), rawMap["uuid"].(string), rawMap["floating_ip"].(string)); err != nil {
+						return err
+					}
 				}
 			}
+
+			// then associate
+			rawNetworks = newNets.([]interface{})
+			for _, raw := range rawNetworks {
+				rawMap := raw.(map[string]interface{})
+				if rawMap["floating_ip"].(string) != "" {
+					log.Printf("[DEBUG] Attemping to associate %v to %v", rawMap["floating_ip"], d.Id())
+					if err := associateFloatingIPNeutron(networkingClient, d.Id(), rawMap["uuid"].(string), rawMap["floating_ip"].(string)); err != nil {
+						return err
+					}
+				}
+			}
+		case "nova-network":
+			// first disassociate
+			rawNetworks := oldNets.([]interface{})
+			for _, raw := range rawNetworks {
+				rawMap := raw.(map[string]interface{})
+				if rawMap["floating_ip"].(string) != "" {
+					log.Printf("[DEBUG] Attemping to disassociate %v from %v", rawMap["floating_ip"], d.Id())
+					if err := disassociateFloatingIPNova(computeClient, d.Id(), rawMap["floating_ip"].(string)); err != nil {
+						return err
+					}
+				}
+			}
+
+			// then associate
+			rawNetworks = newNets.([]interface{})
+			for _, raw := range rawNetworks {
+				rawMap := raw.(map[string]interface{})
+				if rawMap["floating_ip"].(string) != "" {
+					log.Printf("[DEBUG] Attemping to associate %v to %v", rawMap["floating_ip"], d.Id())
+					if err := associateFloatingIPNova(computeClient, d.Id(), rawMap["floating_ip"].(string)); err != nil {
+						return err
+					}
+				}
+			}
+		default:
+			return fmt.Errorf("Unsupported network service: %v", network_service)
 		}
 
-		// then associate
-		rawNetworks = newNets.([]interface{})
-		for _, raw := range rawNetworks {
-			rawMap := raw.(map[string]interface{})
-			if rawMap["floating_ip"].(string) != "" {
-				if err := associateFloatingIPNeutron(networkingClient, d.Id(), rawMap["uuid"].(string), rawMap["floating_ip"].(string)); err != nil {
-					return err
-				}
-			}
-		}
 		d.SetPartial("network")
 	}
 
@@ -762,36 +822,62 @@ func resourceInstanceSecGroupsV2(d *schema.ResourceData) []string {
 }
 
 func resourceInstanceNetworks(d *schema.ResourceData, meta interface{}) ([]servers.Network, error) {
-	config := meta.(*Config)
-	networkingClient, err := config.networkingV2Client(d.Get("region").(string))
-	if err != nil {
-		return nil, err
-	}
 
 	rawNetworks := d.Get("network").([]interface{})
 	networks := make([]servers.Network, len(rawNetworks))
 	newNetworks := make([]map[string]interface{}, len(rawNetworks))
-	for i, raw := range rawNetworks {
-		rawMap := raw.(map[string]interface{})
 
-		networkDetails, err := getNeutronNetwork(networkingClient, rawMap)
+	network_service := d.Get("network_service").(string)
+	switch network_service {
+	case "neutron":
+		config := meta.(*Config)
+		networkingClient, err := config.networkingV2Client(d.Get("region").(string))
 		if err != nil {
 			return nil, err
 		}
 
-		networks[i] = servers.Network{
-			UUID:    networkDetails.ID,
-			Port:    rawMap["port"].(string),
-			FixedIP: rawMap["fixed_ip_v4"].(string),
-		}
+		for i, raw := range rawNetworks {
+			rawMap := raw.(map[string]interface{})
 
-		newNetworks[i] = map[string]interface{}{
-			"uuid":        networkDetails.ID,
-			"name":        networkDetails.Name,
-			"port":        rawMap["port"],
-			"fixed_ip_v4": rawMap["fixed_ip_v4"],
-			"floating_ip": rawMap["floating_ip"],
+			networkDetails, err := getNeutronNetwork(networkingClient, rawMap)
+			if err != nil {
+				return nil, err
+			}
+
+			networks[i] = servers.Network{
+				UUID:    networkDetails.ID,
+				Port:    rawMap["port"].(string),
+				FixedIP: rawMap["fixed_ip_v4"].(string),
+			}
+
+			newNetworks[i] = map[string]interface{}{
+				"uuid":        networkDetails.ID,
+				"name":        networkDetails.Name,
+				"port":        rawMap["port"],
+				"fixed_ip_v4": rawMap["fixed_ip_v4"],
+				"floating_ip": rawMap["floating_ip"],
+			}
 		}
+	case "nova-network":
+		for i, raw := range rawNetworks {
+			rawMap := raw.(map[string]interface{})
+
+			// at this time, gophercloud does not support the os-network extension,
+			// so looking up a network by its name can't happen.
+			networks[i] = servers.Network{
+				UUID:    rawMap["uuid"].(string),
+				FixedIP: rawMap["fixed_ip_v4"].(string),
+			}
+
+			newNetworks[i] = map[string]interface{}{
+				"uuid":        rawMap["uuid"].(string),
+				"name":        rawMap["name"].(string),
+				"fixed_ip_v4": rawMap["fixed_ip_v4"],
+				"floating_ip": rawMap["floating_ip"],
+			}
+		}
+	default:
+		return nil, fmt.Errorf("Unsupported network service: %v", network_service)
 	}
 
 	// feed the networks with added info back into the resource
@@ -861,6 +947,20 @@ func disassociateFloatingIPNeutron(networkingClient *gophercloud.ServiceClient, 
 		return err
 	}
 
+	return nil
+}
+
+func associateFloatingIPNova(computeClient *gophercloud.ServiceClient, serverID, floatingIP string) error {
+	if err := floatingip.Associate(computeClient, serverID, floatingIP).ExtractErr(); err != nil {
+		return fmt.Errorf("Error associating Floating IP: %s", err)
+	}
+	return nil
+}
+
+func disassociateFloatingIPNova(computeClient *gophercloud.ServiceClient, serverID, floatingIP string) error {
+	if err := floatingip.Disassociate(computeClient, serverID, floatingIP).ExtractErr(); err != nil {
+		return fmt.Errorf("Error disassociating Floating IP: %s", err)
+	}
 	return nil
 }
 

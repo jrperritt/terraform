@@ -111,3 +111,13 @@ func envDefaultFunc(k string) schema.SchemaDefaultFunc {
 		return nil, nil
 	}
 }
+
+func envDefaultNetworkServiceFunc(k string) schema.SchemaDefaultFunc {
+	return func() (interface{}, error) {
+		if v := os.Getenv(k); v != "" {
+			return v, nil
+		}
+
+		return "neutron", nil
+	}
+}
