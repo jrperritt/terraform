@@ -406,16 +406,17 @@ func resourceComputeInstanceV2Read(d *schema.ResourceData, meta interface{}) err
 				if floatingIP == "" {
 					floatingIP = address["addr"].(string)
 				}
-			}
-			if address["version"].(float64) == 4 {
-				addresses[n]["fixed_ip_v4"] = address["addr"].(string)
-				if fallbackV4 == "" {
-					fallbackV4 = address["addr"].(string)
-				}
 			} else {
-				addresses[n]["fixed_ip_v6"] = fmt.Sprintf("[%s]", address["addr"].(string))
-				if fallbackV6 == "" {
-					fallbackV6 = address["addr"].(string)
+				if address["version"].(float64) == 4 {
+					addresses[n]["fixed_ip_v4"] = address["addr"].(string)
+					if fallbackV4 == "" {
+						fallbackV4 = address["addr"].(string)
+					}
+				} else {
+					addresses[n]["fixed_ip_v6"] = fmt.Sprintf("[%s]", address["addr"].(string))
+					if fallbackV6 == "" {
+						fallbackV6 = address["addr"].(string)
+					}
 				}
 			}
 			addresses[n]["mac"] = address["OS-EXT-IPS-MAC:mac_addr"].(string)
