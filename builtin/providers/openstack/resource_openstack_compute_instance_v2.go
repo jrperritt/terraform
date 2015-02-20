@@ -379,6 +379,8 @@ func resourceComputeInstanceV2Read(d *schema.ResourceData, meta interface{}) err
 	networks := make([]map[string]interface{}, len(rawNetworks))
 	addresses := make(map[string]map[string]interface{})
 	floatingIP := ""
+	fallbackV4 := ""
+	fallbackV6 := ""
 
 	// gathering network information is a bit of a mess.
 	// the networks block contains information from the user.
@@ -407,8 +409,14 @@ func resourceComputeInstanceV2Read(d *schema.ResourceData, meta interface{}) err
 			}
 			if address["version"].(float64) == 4 {
 				addresses[n]["fixed_ip_v4"] = address["addr"].(string)
+				if fallbackV4 == "" {
+					fallbackV4 = address["addr"].(string)
+				}
 			} else {
 				addresses[n]["fixed_ip_v6"] = fmt.Sprintf("[%s]", address["addr"].(string))
+				if fallbackV6 == "" {
+					fallbackV6 = address["addr"].(string)
+				}
 			}
 			addresses[n]["mac"] = address["OS-EXT-IPS-MAC:mac_addr"].(string)
 		}
@@ -445,6 +453,18 @@ func resourceComputeInstanceV2Read(d *schema.ResourceData, meta interface{}) err
 			"floating_ip": n["floating_ip"],
 			"mac":         n["mac"],
 		}
+	}
+
+	// at this point, if hostv6 and hostv6 are still not set,
+	// then someone launched an instance not specifying any networks
+	// and just let the instance launch on the default network.
+	// so we use the fallbackV*
+	if hostv4 == "" {
+		hostv4 = fallbackV4
+	}
+
+	if hostv6 == "" {
+		hostv6 = fallbackV6
 	}
 
 	d.Set("network", networks)
