@@ -21,7 +21,6 @@ import (
 	"github.com/rackspace/gophercloud/openstack/networking/v2/extensions/layer3/floatingips"
 	"github.com/rackspace/gophercloud/openstack/networking/v2/networks"
 	"github.com/rackspace/gophercloud/openstack/networking/v2/ports"
-	"github.com/rackspace/gophercloud/pagination"
 )
 
 func resourceComputeInstanceV2() *schema.Resource {
@@ -908,27 +907,25 @@ func resourceInstanceNetworks(d *schema.ResourceData, meta interface{}) ([]serve
 }
 
 func getNeutronNetwork(networkingClient *gophercloud.ServiceClient, netInfo map[string]interface{}) (networks.Network, error) {
-	pager := networks.List(networkingClient, networks.ListOpts{
+	var neutronNet networks.Network
+
+	allPages, err := networks.List(networkingClient, networks.ListOpts{
 		Name: netInfo["name"].(string),
 		ID:   netInfo["uuid"].(string),
-	})
-
-	var neutronNet networks.Network
-	err := pager.EachPage(func(page pagination.Page) (bool, error) {
-		networkList, err := networks.ExtractNetworks(page)
-		if err != nil {
-			return false, err
-		}
-		for _, network := range networkList {
-			neutronNet = network
-			return false, nil
-		}
-		return true, nil
-	})
-
+	}).AllPages()
 	if err != nil {
 		return neutronNet, err
 	}
+
+	networkList, err := networks.ExtractNetworks(allPages)
+	if err != nil {
+		return neutronNet, err
+	}
+
+	for _, network := range networkList {
+		neutronNet = network
+	}
+
 	return neutronNet, nil
 }
 
@@ -986,49 +983,45 @@ func disassociateFloatingIPNova(computeClient *gophercloud.ServiceClient, server
 }
 
 func getInstancePortIDNeutron(networkingClient *gophercloud.ServiceClient, instanceID, networkID string) (string, error) {
-	pager := ports.List(networkingClient, ports.ListOpts{
+	var portID string
+
+	allPages, err := ports.List(networkingClient, ports.ListOpts{
 		DeviceID:  instanceID,
 		NetworkID: networkID,
-	})
-
-	var portID string
-	err := pager.EachPage(func(page pagination.Page) (bool, error) {
-		portList, err := ports.ExtractPorts(page)
-		if err != nil {
-			return false, err
-		}
-		for _, port := range portList {
-			portID = port.ID
-			return false, nil
-		}
-		return true, nil
-	})
-
+	}).AllPages()
 	if err != nil {
 		return "", err
 	}
+
+	portList, err := ports.ExtractPorts(allPages)
+	if err != nil {
+		return "", err
+	}
+
+	for _, port := range portList {
+		portID = port.ID
+	}
+
 	return portID, nil
 }
 
 func getFloatingIPIDNeutron(networkingClient *gophercloud.ServiceClient, fip string) (string, error) {
-	pager := floatingips.List(networkingClient, floatingips.ListOpts{
-		FloatingIP: fip,
-	})
-
 	ips := []floatingips.FloatingIP{}
-	err := pager.EachPage(func(page pagination.Page) (bool, error) {
-		floatingipList, err := floatingips.ExtractFloatingIPs(page)
-		if err != nil {
-			return false, err
-		}
-		for _, f := range floatingipList {
-			ips = append(ips, f)
-		}
-		return true, nil
-	})
 
+	allPages, err := floatingips.List(networkingClient, floatingips.ListOpts{
+		FloatingIP: fip,
+	}).AllPages()
 	if err != nil {
 		return "", err
+	}
+
+	floatingipList, err := floatingips.ExtractFloatingIPs(allPages)
+	if err != nil {
+		return "", err
+	}
+
+	for _, f := range floatingipList {
+		ips = append(ips, f)
 	}
 
 	if len(ips) > 1 {
@@ -1072,24 +1065,26 @@ func getImageID(client *gophercloud.ServiceClient, d *schema.ResourceData) (stri
 
 	imageCount := 0
 	imageName := d.Get("image_name").(string)
-	if imageName != "" {
-		pager := images.ListDetail(client, &images.ListOpts{
-			Name: imageName,
-		})
-		pager.EachPage(func(page pagination.Page) (bool, error) {
-			imageList, err := images.ExtractImages(page)
-			if err != nil {
-				return false, err
-			}
 
-			for _, i := range imageList {
-				if i.Name == imageName {
-					imageCount++
-					imageId = i.ID
-				}
+	if imageName != "" {
+		allPages, err := images.ListDetail(client, &images.ListOpts{
+			Name: imageName,
+		}).AllPages()
+		if err != nil {
+			return "", nil
+		}
+
+		imageList, err := images.ExtractImages(allPages)
+		if err != nil {
+			return "", err
+		}
+
+		for _, i := range imageList {
+			if i.Name == imageName {
+				imageCount++
+				imageId = i.ID
 			}
-			return true, nil
-		})
+		}
 
 		switch imageCount {
 		case 0:
@@ -1112,22 +1107,24 @@ func getFlavorID(client *gophercloud.ServiceClient, d *schema.ResourceData) (str
 
 	flavorCount := 0
 	flavorName := d.Get("flavor_name").(string)
-	if flavorName != "" {
-		pager := flavors.ListDetail(client, nil)
-		pager.EachPage(func(page pagination.Page) (bool, error) {
-			flavorList, err := flavors.ExtractFlavors(page)
-			if err != nil {
-				return false, err
-			}
 
-			for _, f := range flavorList {
-				if f.Name == flavorName {
-					flavorCount++
-					flavorId = f.ID
-				}
+	if flavorName != "" {
+		allPages, err := flavors.ListDetail(client, nil).AllPages()
+		if err != nil {
+			return "", err
+		}
+
+		flavorList, err := flavors.ExtractFlavors(allPages)
+		if err != nil {
+			return "", err
+		}
+
+		for _, f := range flavorList {
+			if f.Name == flavorName {
+				flavorCount++
+				flavorId = f.ID
 			}
-			return true, nil
-		})
+		}
 
 		switch flavorCount {
 		case 0:
@@ -1222,18 +1219,14 @@ func detachVolumesFromInstance(computeClient *gophercloud.ServiceClient, blockCl
 
 func getVolumeAttachments(computeClient *gophercloud.ServiceClient, serverId string) ([]volumeattach.VolumeAttachment, error) {
 	var attachments []volumeattach.VolumeAttachment
-	err := volumeattach.List(computeClient, serverId).EachPage(func(page pagination.Page) (bool, error) {
-		actual, err := volumeattach.ExtractVolumeAttachments(page)
-		if err != nil {
-			return false, err
-		}
-
-		attachments = actual
-		return true, nil
-	})
-
+	allPages, err := volumeattach.List(computeClient, serverId).AllPages()
 	if err != nil {
-		return nil, err
+		return attachments, err
+	}
+
+	attachments, err = volumeattach.ExtractVolumeAttachments(allPages)
+	if err != nil {
+		return attachments, err
 	}
 
 	return attachments, nil
