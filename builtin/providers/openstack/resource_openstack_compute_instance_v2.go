@@ -14,6 +14,7 @@ import (
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/floatingip"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/keypairs"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/secgroups"
+	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/tenantnetworks"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/volumeattach"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/flavors"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/images"
@@ -238,9 +239,18 @@ func resourceComputeInstanceV2Create(d *schema.ResourceData, meta interface{}) e
 		return err
 	}
 
-	networks, err := resourceInstanceNetworks(d, meta)
+	networkDetails, err := resourceInstanceNetworks(d, meta)
 	if err != nil {
 		return err
+	}
+
+	networks := make([]servers.Network, len(networkDetails))
+	for i, net := range networkDetails {
+		networks[i] = servers.Network{
+			UUID:    net["uuid"].(string),
+			Port:    net["port"].(string),
+			FixedIP: net["fixed_ip_v4"].(string),
+		}
 	}
 
 	createOpts = &servers.CreateOpts{
@@ -305,8 +315,8 @@ func resourceComputeInstanceV2Create(d *schema.ResourceData, meta interface{}) e
 	// if a floating IP was specified, associate it to the instance
 	rawNetworks := d.Get("network").([]interface{})
 
-	network_service := d.Get("network_service").(string)
-	switch network_service {
+	networkService := d.Get("network_service").(string)
+	switch networkService {
 	case "neutron":
 		networkingClient, err := config.networkingV2Client(d.Get("region").(string))
 		if err != nil {
@@ -332,7 +342,7 @@ func resourceComputeInstanceV2Create(d *schema.ResourceData, meta interface{}) e
 			}
 		}
 	default:
-		return fmt.Errorf("Unsupported network service: %v", network_service)
+		return fmt.Errorf("Unsupported network service: %v", networkService)
 	}
 
 	// were volume attachments specified?
@@ -369,75 +379,31 @@ func resourceComputeInstanceV2Read(d *schema.ResourceData, meta interface{}) err
 	d.Set("region", d.Get("region").(string))
 	d.Set("name", server.Name)
 
+	// begin reading the network configuration
 	d.Set("access_ip_v4", server.AccessIPv4)
 	d.Set("access_ip_v6", server.AccessIPv6)
 	hostv4 := server.AccessIPv4
 	hostv6 := server.AccessIPv6
 
-	rawNetworks := d.Get("network").([]interface{})
-	networks := make([]map[string]interface{}, len(rawNetworks))
-	addresses := make(map[string]map[string]interface{})
-	floatingIP := ""
-	fallbackV4 := ""
-	fallbackV6 := ""
+	addresses := resourceInstanceAddresses(server.Addresses)
+	networkDetails, err := resourceInstanceNetworks(d, meta)
+	networks := make([]map[string]interface{}, len(networkDetails))
+	if err != nil {
+		return err
+	}
 
-	// gathering network information is a bit of a mess.
-	// the networks block contains information from the user.
-	//
-	// the networks block is a numerical array.
-	//
-	// the server.Addresses block contains supplemental information.
-	//
-	// server.Addresses is keyed by the network name.
-	//
-	// the commonality between server.Addresses and the networks block is
-	// the network name.
-	//
-	// So first, create a map indexed by the network name and gather the
-	// useful information from server.Addresses
-	for n, networkAddresses := range server.Addresses {
-		addresses[n] = make(map[string]interface{})
-		for _, element := range networkAddresses.([]interface{}) {
-			address := element.(map[string]interface{})
-			if address["OS-EXT-IPS:type"] == "floating" {
-				addresses[n]["floating_ip"] = address["addr"]
-				// grab the first floating IP found
-				if floatingIP == "" {
-					floatingIP = address["addr"].(string)
-				}
-			} else {
-				if address["version"].(float64) == 4 {
-					addresses[n]["fixed_ip_v4"] = address["addr"].(string)
-					if fallbackV4 == "" {
-						fallbackV4 = address["addr"].(string)
-					}
-				} else {
-					addresses[n]["fixed_ip_v6"] = fmt.Sprintf("[%s]", address["addr"].(string))
-					if fallbackV6 == "" {
-						fallbackV6 = address["addr"].(string)
-					}
-				}
+	// Loop through all networks and merge relevant address details.
+	// Build an array of network information and set it in terraform.
+	// Also, determine the correct floating and fixed IPs for access.
+	for i, net := range networkDetails {
+		n := addresses[net["name"].(string)]
+
+		if floatingIP, ok := n["floating_ip"]; ok {
+			hostv4 = floatingIP.(string)
+		} else {
+			if hostv4 == "" && n["fixed_ip_v4"] != nil {
+				hostv4 = n["fixed_ip_v4"].(string)
 			}
-			addresses[n]["mac"] = address["OS-EXT-IPS-MAC:mac_addr"].(string)
-		}
-	}
-
-	log.Printf("[DEBUG] Addresses: %v", addresses)
-
-	// if a floating IP was found above, use it
-	if floatingIP != "" {
-		hostv4 = floatingIP
-	}
-
-	// once all the server.Addresses info has been gathered,
-	// loop through the network block and complement the existing information.
-	for i, raw := range rawNetworks {
-		rawMap := raw.(map[string]interface{})
-		netName := rawMap["name"].(string)
-		n := addresses[netName]
-
-		if hostv4 == "" && n["fixed_ip_v4"] != nil {
-			hostv4 = n["fixed_ip_v4"].(string)
 		}
 
 		if hostv6 == "" && n["fixed_ip_v6"] != nil {
@@ -445,26 +411,14 @@ func resourceComputeInstanceV2Read(d *schema.ResourceData, meta interface{}) err
 		}
 
 		networks[i] = map[string]interface{}{
-			"uuid":        rawMap["uuid"],
-			"name":        rawMap["name"],
-			"port":        rawMap["port"],
+			"uuid":        networkDetails[i]["uuid"],
+			"name":        networkDetails[i]["name"],
+			"port":        networkDetails[i]["port"],
 			"fixed_ip_v4": n["fixed_ip_v4"],
 			"fixed_ip_v6": n["fixed_ip_v6"],
 			"floating_ip": n["floating_ip"],
 			"mac":         n["mac"],
 		}
-	}
-
-	// at this point, if hostv6 and hostv6 are still not set,
-	// then someone launched an instance not specifying any networks
-	// and just let the instance launch on the default network.
-	// so we use the fallbackV*
-	if hostv4 == "" {
-		hostv4 = fallbackV4
-	}
-
-	if hostv6 == "" {
-		hostv6 = fallbackV6
 	}
 
 	d.Set("network", networks)
@@ -473,6 +427,7 @@ func resourceComputeInstanceV2Read(d *schema.ResourceData, meta interface{}) err
 	log.Printf("hostv4: %s", hostv4)
 	log.Printf("hostv6: %s", hostv6)
 
+	// prefer the v6 address if no v4 address exists.
 	preferredv := ""
 	if hostv4 != "" {
 		preferredv = hostv4
@@ -487,6 +442,7 @@ func resourceComputeInstanceV2Read(d *schema.ResourceData, meta interface{}) err
 			"host": preferredv,
 		})
 	}
+	// end network configuration
 
 	d.Set("metadata", server.Metadata)
 
@@ -630,8 +586,8 @@ func resourceComputeInstanceV2Update(d *schema.ResourceData, meta interface{}) e
 		log.Printf("[DEBUG] Detected network change.")
 		oldNets, newNets := d.GetChange("network")
 
-		network_service := d.Get("network_service").(string)
-		switch network_service {
+		networkService := d.Get("network_service").(string)
+		switch networkService {
 		case "neutron":
 			networkingClient, err := config.networkingV2Client(d.Get("region").(string))
 			if err != nil {
@@ -685,7 +641,7 @@ func resourceComputeInstanceV2Update(d *schema.ResourceData, meta interface{}) e
 				}
 			}
 		default:
-			return fmt.Errorf("Unsupported network service: %v", network_service)
+			return fmt.Errorf("Unsupported network service: %v", networkService)
 		}
 
 		d.SetPartial("network")
@@ -841,16 +797,15 @@ func resourceInstanceSecGroupsV2(d *schema.ResourceData) []string {
 	return secgroups
 }
 
-func resourceInstanceNetworks(d *schema.ResourceData, meta interface{}) ([]servers.Network, error) {
+func resourceInstanceNetworks(d *schema.ResourceData, meta interface{}) ([]map[string]interface{}, error) {
 
+	config := meta.(*Config)
 	rawNetworks := d.Get("network").([]interface{})
-	networks := make([]servers.Network, len(rawNetworks))
 	newNetworks := make([]map[string]interface{}, len(rawNetworks))
+	networkService := d.Get("network_service").(string)
 
-	network_service := d.Get("network_service").(string)
-	switch network_service {
+	switch networkService {
 	case "neutron":
-		config := meta.(*Config)
 		networkingClient, err := config.networkingV2Client(d.Get("region").(string))
 		if err != nil {
 			return nil, err
@@ -864,10 +819,26 @@ func resourceInstanceNetworks(d *schema.ResourceData, meta interface{}) ([]serve
 				return nil, err
 			}
 
-			networks[i] = servers.Network{
-				UUID:    networkDetails.ID,
-				Port:    rawMap["port"].(string),
-				FixedIP: rawMap["fixed_ip_v4"].(string),
+			newNetworks[i] = map[string]interface{}{
+				"uuid":        networkDetails.ID,
+				"name":        networkDetails.Name,
+				"port":        rawMap["port"],
+				"fixed_ip_v4": rawMap["fixed_ip_v4"],
+				"floating_ip": rawMap["floating_ip"],
+			}
+		}
+	case "nova-network":
+		computeClient, err := config.computeV2Client(d.Get("region").(string))
+		if err != nil {
+			return nil, err
+		}
+
+		for i, raw := range rawNetworks {
+			rawMap := raw.(map[string]interface{})
+
+			networkDetails, err := getNovaNetwork(computeClient, rawMap)
+			if err != nil {
+				return nil, err
 			}
 
 			newNetworks[i] = map[string]interface{}{
@@ -878,32 +849,14 @@ func resourceInstanceNetworks(d *schema.ResourceData, meta interface{}) ([]serve
 				"floating_ip": rawMap["floating_ip"],
 			}
 		}
-	case "nova-network":
-		for i, raw := range rawNetworks {
-			rawMap := raw.(map[string]interface{})
-
-			// at this time, gophercloud does not support the os-network extension,
-			// so looking up a network by its name can't happen.
-			networks[i] = servers.Network{
-				UUID:    rawMap["uuid"].(string),
-				FixedIP: rawMap["fixed_ip_v4"].(string),
-			}
-
-			newNetworks[i] = map[string]interface{}{
-				"uuid":        rawMap["uuid"].(string),
-				"name":        rawMap["name"].(string),
-				"fixed_ip_v4": rawMap["fixed_ip_v4"],
-				"floating_ip": rawMap["floating_ip"],
-			}
-		}
 	default:
-		return nil, fmt.Errorf("Unsupported network service: %v", network_service)
+		return nil, fmt.Errorf("Unsupported network service: %v", networkService)
 	}
 
 	// feed the networks with added info back into the resource
 	d.Set("network", newNetworks)
 
-	return networks, nil
+	return newNetworks, nil
 }
 
 func getNeutronNetwork(networkingClient *gophercloud.ServiceClient, netInfo map[string]interface{}) (networks.Network, error) {
@@ -926,7 +879,59 @@ func getNeutronNetwork(networkingClient *gophercloud.ServiceClient, netInfo map[
 		neutronNet = network
 	}
 
+	log.Printf("[DEBUG] neutron network to use: %+v", neutronNet)
 	return neutronNet, nil
+}
+
+func getNovaNetwork(computeClient *gophercloud.ServiceClient, netInfo map[string]interface{}) (tenantnetworks.Network, error) {
+	var novaNet tenantnetworks.Network
+
+	allPages, err := tenantnetworks.List(computeClient).AllPages()
+	if err != nil {
+		return novaNet, err
+	}
+
+	networkList, err := tenantnetworks.ExtractNetworks(allPages)
+	if err != nil {
+		return novaNet, err
+	}
+
+	for _, network := range networkList {
+		if network.Name == netInfo["name"] {
+			novaNet = network
+		}
+		if network.ID == netInfo["uuid"] {
+			novaNet = network
+		}
+	}
+
+	log.Printf("[DEBUG] nova network to use: %+v", novaNet)
+	return novaNet, nil
+}
+
+func resourceInstanceAddresses(addresses map[string]interface{}) map[string]map[string]interface{} {
+
+	addrs := make(map[string]map[string]interface{})
+	for n, networkAddresses := range addresses {
+		addrs[n] = make(map[string]interface{})
+		for _, element := range networkAddresses.([]interface{}) {
+			address := element.(map[string]interface{})
+			if address["OS-EXT-IPS:type"] == "floating" {
+				addrs[n]["floating_ip"] = address["addr"]
+			} else {
+				if address["version"].(float64) == 4 {
+					addrs[n]["fixed_ip_v4"] = address["addr"].(string)
+				} else {
+					addrs[n]["fixed_ip_v6"] = fmt.Sprintf("[%s]", address["addr"].(string))
+				}
+			}
+			addrs[n]["mac"] = address["OS-EXT-IPS-MAC:mac_addr"].(string)
+		}
+	}
+
+	log.Printf("[DEBUG] Addresses: %+v", addresses)
+
+	return addrs
 }
 
 func associateFloatingIPNeutron(networkingClient *gophercloud.ServiceClient, serverID, networkID, floatingIP string) error {
