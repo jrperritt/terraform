@@ -10,7 +10,6 @@ import (
 	"github.com/rackspace/gophercloud/openstack/blockstorage/v1/volumes"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/volumeattach"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/servers"
-	"github.com/rackspace/gophercloud/pagination"
 )
 
 func TestAccComputeV2Instance_basic(t *testing.T) {
@@ -132,24 +131,23 @@ func testAccCheckComputeV2InstanceMetadata(
 func testAccCheckComputeV2InstanceVolumeAttachment(
 	instance *servers.Server, volume *volumes.Volume) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
-		var attachments []volumeattach.VolumeAttachment
-
 		config := testAccProvider.Meta().(*Config)
 		computeClient, err := config.computeV2Client(OS_REGION_NAME)
 		if err != nil {
 			return err
 		}
-		err = volumeattach.List(computeClient, instance.ID).EachPage(func(page pagination.Page) (bool, error) {
-			actual, err := volumeattach.ExtractVolumeAttachments(page)
-			if err != nil {
-				return false, fmt.Errorf("Unable to lookup attachment: %s", err)
-			}
 
-			attachments = actual
-			return true, nil
-		})
+		allPages, err := volumeattach.List(computeClient, instance.ID).AllPages()
+		if err != nil {
+			return err
+		}
 
-		for _, attachment := range attachments {
+		volumeList, err := volumeattach.ExtractVolumeAttachments(allPages)
+		if err != nil {
+			return err
+		}
+
+		for _, attachment := range volumeList {
 			if attachment.VolumeID == volume.ID {
 				return nil
 			}
