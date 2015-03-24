@@ -88,8 +88,6 @@ func resourceComputeFloatingIPV2Read(d *schema.ResourceData, meta interface{}) e
 
 	log.Printf("[DEBUG] Retrieved Floating IP %s: %+v", d.Id(), fip)
 
-	d.Set("id", d.Id())
-	d.Set("region", d.Get("region").(string))
 	d.Set("pool", fip.Pool)
 	d.Set("instance_id", fip.InstanceID)
 	d.Set("address", fip.IP)
