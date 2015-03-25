@@ -841,24 +841,26 @@ func getImageID(client *gophercloud.ServiceClient, d *schema.ResourceData) (stri
 
 	imageCount := 0
 	imageName := d.Get("image_name").(string)
-	if imageName != "" {
-		pager := images.ListDetail(client, &images.ListOpts{
-			Name: imageName,
-		})
-		pager.EachPage(func(page pagination.Page) (bool, error) {
-			imageList, err := images.ExtractImages(page)
-			if err != nil {
-				return false, err
-			}
 
-			for _, i := range imageList {
-				if i.Name == imageName {
-					imageCount++
-					imageId = i.ID
-				}
+	if imageName != "" {
+		allPages, err := images.ListDetail(client, &images.ListOpts{
+			Name: imageName,
+		}).AllPages()
+		if err != nil {
+			return "", nil
+		}
+
+		imageList, err := images.ExtractImages(allPages)
+		if err != nil {
+			return "", err
+		}
+
+		for _, i := range imageList {
+			if i.Name == imageName {
+				imageCount++
+				imageId = i.ID
 			}
-			return true, nil
-		})
+		}
 
 		switch imageCount {
 		case 0:
@@ -881,22 +883,24 @@ func getFlavorID(client *gophercloud.ServiceClient, d *schema.ResourceData) (str
 
 	flavorCount := 0
 	flavorName := d.Get("flavor_name").(string)
-	if flavorName != "" {
-		pager := flavors.ListDetail(client, nil)
-		pager.EachPage(func(page pagination.Page) (bool, error) {
-			flavorList, err := flavors.ExtractFlavors(page)
-			if err != nil {
-				return false, err
-			}
 
-			for _, f := range flavorList {
-				if f.Name == flavorName {
-					flavorCount++
-					flavorId = f.ID
-				}
+	if flavorName != "" {
+		allPages, err := flavors.ListDetail(client, nil).AllPages()
+		if err != nil {
+			return "", err
+		}
+
+		flavorList, err := flavors.ExtractFlavors(allPages)
+		if err != nil {
+			return "", err
+		}
+
+		for _, f := range flavorList {
+			if f.Name == flavorName {
+				flavorCount++
+				flavorId = f.ID
 			}
-			return true, nil
-		})
+		}
 
 		switch flavorCount {
 		case 0:
@@ -993,18 +997,14 @@ func detachVolumesFromInstance(computeClient *gophercloud.ServiceClient, blockCl
 
 func getVolumeAttachments(computeClient *gophercloud.ServiceClient, serverId string) ([]volumeattach.VolumeAttachment, error) {
 	var attachments []volumeattach.VolumeAttachment
-	err := volumeattach.List(computeClient, serverId).EachPage(func(page pagination.Page) (bool, error) {
-		actual, err := volumeattach.ExtractVolumeAttachments(page)
-		if err != nil {
-			return false, err
-		}
-
-		attachments = actual
-		return true, nil
-	})
-
+	allPages, err := volumeattach.List(computeClient, serverId).AllPages()
 	if err != nil {
-		return nil, err
+		return attachments, err
+	}
+
+	attachments, err = volumeattach.ExtractVolumeAttachments(allPages)
+	if err != nil {
+		return attachments, err
 	}
 
 	return attachments, nil
