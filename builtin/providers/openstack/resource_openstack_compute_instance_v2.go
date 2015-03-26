@@ -322,7 +322,11 @@ func resourceComputeInstanceV2Create(d *schema.ResourceData, meta interface{}) e
 	}
 	floatingIP := d.Get("floating_ip").(string)
 	if floatingIP != "" {
-		if err := floatingip.Associate(computeClient, server.ID, floatingIP).ExtractErr(); err != nil {
+		associateOpts := floatingip.AssociateOpts{
+			ServerID:   server.ID,
+			FloatingIP: floatingIP,
+		}
+		if err := floatingip.Associate(computeClient, associateOpts).ExtractErr(); err != nil {
 			return fmt.Errorf("Error associating floating IP: %s", err)
 		}
 	}
@@ -598,14 +602,22 @@ func resourceComputeInstanceV2Update(d *schema.ResourceData, meta interface{}) e
 		log.Printf("[DEBUG] New Floating IP: %v", newFIP)
 		if oldFIP.(string) != "" {
 			log.Printf("[DEBUG] Attemping to disassociate %s from %s", oldFIP, d.Id())
-			if err := floatingip.Disassociate(computeClient, d.Id(), oldFIP.(string)).ExtractErr(); err != nil {
+			associateOpts := floatingip.AssociateOpts{
+				ServerID:   d.Id(),
+				FloatingIP: oldFIP.(string),
+			}
+			if err := floatingip.Disassociate(computeClient, associateOpts).ExtractErr(); err != nil {
 				return fmt.Errorf("Error disassociating Floating IP during update: %s", err)
 			}
 		}
 
 		if newFIP.(string) != "" {
 			log.Printf("[DEBUG] Attemping to associate %s to %s", newFIP, d.Id())
-			if err := floatingip.Associate(computeClient, d.Id(), newFIP.(string)).ExtractErr(); err != nil {
+			associateOpts := floatingip.AssociateOpts{
+				ServerID:   d.Id(),
+				FloatingIP: oldFIP.(string),
+			}
+			if err := floatingip.Associate(computeClient, associateOpts).ExtractErr(); err != nil {
 				return fmt.Errorf("Error associating Floating IP during update: %s", err)
 			}
 		}
