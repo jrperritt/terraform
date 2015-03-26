@@ -137,6 +137,11 @@ func resourceComputeInstanceV2() *schema.Resource {
 							Type:     schema.TypeString,
 							Computed: true,
 						},
+						"set_floating_ip": &schema.Schema{
+							Type:     schema.TypeBool,
+							Optional: true,
+							Default:  false,
+						},
 					},
 				},
 			},
@@ -320,14 +325,20 @@ func resourceComputeInstanceV2Create(d *schema.ResourceData, meta interface{}) e
 			"Error waiting for instance (%s) to become ready: %s",
 			server.ID, err)
 	}
+
+	// Do kind of a pre-Read here in order to handle possible floating IP scenarios
+	server, err = servers.Get(computeClient, d.Id()).Extract()
+	if err != nil {
+		return CheckDeleted(d, err, "server")
+	}
+	if err := updateNetworkDetails(computeClient, d, server); err != nil {
+		return err
+	}
+
 	floatingIP := d.Get("floating_ip").(string)
 	if floatingIP != "" {
-		associateOpts := floatingip.AssociateOpts{
-			ServerID:   server.ID,
-			FloatingIP: floatingIP,
-		}
-		if err := floatingip.Associate(computeClient, associateOpts).ExtractErr(); err != nil {
-			return fmt.Errorf("Error associating floating IP: %s", err)
+		if err := associateFloatingIP(computeClient, d, server.ID, floatingIP); err != nil {
+			return err
 		}
 	}
 
@@ -364,100 +375,6 @@ func resourceComputeInstanceV2Read(d *schema.ResourceData, meta interface{}) err
 
 	d.Set("name", server.Name)
 
-	// begin reading the network configuration
-	d.Set("access_ip_v4", server.AccessIPv4)
-	d.Set("access_ip_v6", server.AccessIPv6)
-	hostv4 := server.AccessIPv4
-	hostv6 := server.AccessIPv6
-
-	networkDetails, err := resourceInstanceNetworks(computeClient, d)
-	addresses := resourceInstanceAddresses(server.Addresses)
-	if err != nil {
-		return err
-	}
-
-	// if there are no networkDetails, make networks at least a length of 1
-	networkLength := 1
-	if len(networkDetails) > 0 {
-		networkLength = len(networkDetails)
-	}
-	networks := make([]map[string]interface{}, networkLength)
-
-	// Loop through all networks and addresses,
-	// merge relevant address details.
-	if len(networkDetails) == 0 {
-		for _, n := range addresses {
-			if floatingIP, ok := n["floating_ip"]; ok {
-				hostv4 = floatingIP.(string)
-			} else {
-				if hostv4 == "" && n["fixed_ip_v4"] != nil {
-					hostv4 = n["fixed_ip_v4"].(string)
-				}
-			}
-
-			if hostv6 == "" && n["fixed_ip_v6"] != nil {
-				hostv6 = n["fixed_ip_v6"].(string)
-			}
-
-			networks[0] = map[string]interface{}{
-				"name":        n,
-				"fixed_ip_v4": n["fixed_ip_v4"],
-				"fixed_ip_v6": n["fixed_ip_v6"],
-				"mac":         n["mac"],
-			}
-		}
-	} else {
-		for i, net := range networkDetails {
-			n := addresses[net["name"].(string)]
-
-			if floatingIP, ok := n["floating_ip"]; ok {
-				hostv4 = floatingIP.(string)
-			} else {
-				if hostv4 == "" && n["fixed_ip_v4"] != nil {
-					hostv4 = n["fixed_ip_v4"].(string)
-				}
-			}
-
-			if hostv6 == "" && n["fixed_ip_v6"] != nil {
-				hostv6 = n["fixed_ip_v6"].(string)
-			}
-
-			networks[i] = map[string]interface{}{
-				"uuid":        networkDetails[i]["uuid"],
-				"name":        networkDetails[i]["name"],
-				"port":        networkDetails[i]["port"],
-				"fixed_ip_v4": n["fixed_ip_v4"],
-				"fixed_ip_v6": n["fixed_ip_v6"],
-				"mac":         n["mac"],
-			}
-		}
-	}
-
-	log.Printf("[DEBUG] new networks: %+v", networks)
-
-	d.Set("network", networks)
-	d.Set("access_ip_v4", hostv4)
-	d.Set("access_ip_v6", hostv6)
-	log.Printf("hostv4: %s", hostv4)
-	log.Printf("hostv6: %s", hostv6)
-
-	// prefer the v6 address if no v4 address exists.
-	preferredv := ""
-	if hostv4 != "" {
-		preferredv = hostv4
-	} else if hostv6 != "" {
-		preferredv = hostv6
-	}
-
-	if preferredv != "" {
-		// Initialize the connection info
-		d.SetConnInfo(map[string]string{
-			"type": "ssh",
-			"host": preferredv,
-		})
-	}
-	// end network configuration
-
 	d.Set("metadata", server.Metadata)
 
 	secGrpNames := []string{}
@@ -489,6 +406,10 @@ func resourceComputeInstanceV2Read(d *schema.ResourceData, meta interface{}) err
 		return err
 	}
 	d.Set("image_name", image.Name)
+
+	if err := updateNetworkDetails(computeClient, d, server); err != nil {
+		return err
+	}
 
 	// volume attachments
 	vas, err := getVolumeAttachments(computeClient, d.Id())
@@ -601,24 +522,13 @@ func resourceComputeInstanceV2Update(d *schema.ResourceData, meta interface{}) e
 		log.Printf("[DEBUG] Old Floating IP: %v", oldFIP)
 		log.Printf("[DEBUG] New Floating IP: %v", newFIP)
 		if oldFIP.(string) != "" {
-			log.Printf("[DEBUG] Attemping to disassociate %s from %s", oldFIP, d.Id())
-			associateOpts := floatingip.AssociateOpts{
-				ServerID:   d.Id(),
-				FloatingIP: oldFIP.(string),
-			}
-			if err := floatingip.Disassociate(computeClient, associateOpts).ExtractErr(); err != nil {
-				return fmt.Errorf("Error disassociating Floating IP during update: %s", err)
+			if err := disassociateFloatingIP(computeClient, d.Id(), oldFIP.(string)); err != nil {
+				return err
 			}
 		}
-
 		if newFIP.(string) != "" {
-			log.Printf("[DEBUG] Attemping to associate %s to %s", newFIP, d.Id())
-			associateOpts := floatingip.AssociateOpts{
-				ServerID:   d.Id(),
-				FloatingIP: oldFIP.(string),
-			}
-			if err := floatingip.Associate(computeClient, associateOpts).ExtractErr(); err != nil {
-				return fmt.Errorf("Error associating Floating IP during update: %s", err)
+			if err := associateFloatingIP(computeClient, d, d.Id(), newFIP.(string)); err != nil {
+				return err
 			}
 		}
 	}
@@ -802,10 +712,11 @@ func resourceInstanceNetworks(computeClient *gophercloud.ServiceClient, d *schem
 		}
 
 		newNetworks[i] = map[string]interface{}{
-			"uuid":        tenantnet.ID,
-			"name":        tenantnet.Name,
-			"port":        rawMap["port"].(string),
-			"fixed_ip_v4": rawMap["fixed_ip_v4"].(string),
+			"uuid":            tenantnet.ID,
+			"name":            tenantnet.Name,
+			"port":            rawMap["port"].(string),
+			"fixed_ip_v4":     rawMap["fixed_ip_v4"].(string),
+			"set_floating_ip": rawMap["set_floating_ip"].(bool),
 		}
 	}
 
@@ -841,6 +752,143 @@ func resourceInstanceAddresses(addresses map[string]interface{}) map[string]map[
 	return addrs
 }
 
+func updateNetworkDetails(computeClient *gophercloud.ServiceClient, d *schema.ResourceData, server *servers.Server) error {
+	d.Set("access_ip_v4", server.AccessIPv4)
+	d.Set("access_ip_v6", server.AccessIPv6)
+	hostv4 := server.AccessIPv4
+	hostv6 := server.AccessIPv6
+
+	networkDetails, err := resourceInstanceNetworks(computeClient, d)
+	addresses := resourceInstanceAddresses(server.Addresses)
+	if err != nil {
+		return err
+	}
+
+	// if there are no networkDetails, make networks at least a length of 1
+	networkLength := 1
+	if len(networkDetails) > 0 {
+		networkLength = len(networkDetails)
+	}
+	networks := make([]map[string]interface{}, networkLength)
+
+	// Loop through all networks and addresses,
+	// merge relevant address details.
+	if len(networkDetails) == 0 {
+		for _, n := range addresses {
+			if floatingIP, ok := n["floating_ip"]; ok {
+				hostv4 = floatingIP.(string)
+			} else {
+				if hostv4 == "" && n["fixed_ip_v4"] != nil {
+					hostv4 = n["fixed_ip_v4"].(string)
+				}
+			}
+
+			if hostv6 == "" && n["fixed_ip_v6"] != nil {
+				hostv6 = n["fixed_ip_v6"].(string)
+			}
+
+			networks[0] = map[string]interface{}{
+				"name":        n,
+				"fixed_ip_v4": n["fixed_ip_v4"],
+				"fixed_ip_v6": n["fixed_ip_v6"],
+				"mac":         n["mac"],
+			}
+		}
+	} else {
+		for i, net := range networkDetails {
+			n := addresses[net["name"].(string)]
+
+			if floatingIP, ok := n["floating_ip"]; ok {
+				hostv4 = floatingIP.(string)
+			} else {
+				if hostv4 == "" && n["fixed_ip_v4"] != nil {
+					hostv4 = n["fixed_ip_v4"].(string)
+				}
+			}
+
+			if hostv6 == "" && n["fixed_ip_v6"] != nil {
+				hostv6 = n["fixed_ip_v6"].(string)
+			}
+
+			networks[i] = map[string]interface{}{
+				"uuid":            networkDetails[i]["uuid"],
+				"name":            networkDetails[i]["name"],
+				"port":            networkDetails[i]["port"],
+				"fixed_ip_v4":     n["fixed_ip_v4"],
+				"fixed_ip_v6":     n["fixed_ip_v6"],
+				"mac":             n["mac"],
+				"set_floating_ip": networkDetails[i]["set_floating_ip"],
+			}
+		}
+	}
+
+	log.Printf("[DEBUG] new networks: %+v", networks)
+
+	d.Set("network", networks)
+	d.Set("access_ip_v4", hostv4)
+	d.Set("access_ip_v6", hostv6)
+	log.Printf("hostv4: %s", hostv4)
+	log.Printf("hostv6: %s", hostv6)
+
+	// prefer the v6 address if no v4 address exists.
+	preferredv := ""
+	if hostv4 != "" {
+		preferredv = hostv4
+	} else if hostv6 != "" {
+		preferredv = hostv6
+	}
+
+	if preferredv != "" {
+		// Initialize the connection info
+		d.SetConnInfo(map[string]string{
+			"type": "ssh",
+			"host": preferredv,
+		})
+	}
+
+	return nil
+}
+
+func associateFloatingIP(computeClient *gophercloud.ServiceClient, d *schema.ResourceData, serverId, floatingIP string) error {
+	fixedIP := ""
+
+	rawNetworks := d.Get("network").([]interface{})
+	if len(rawNetworks) > 1 {
+		for _, raw := range rawNetworks {
+			rawMap := raw.(map[string]interface{})
+			if rawMap["set_floating_ip"].(bool) == true {
+				fixedIP = rawMap["fixed_ip_v4"].(string)
+				log.Printf("[DEBUG] Will use fixed IP %s for floating IP %s", fixedIP, floatingIP)
+			}
+		}
+	}
+
+	associateOpts := floatingip.AssociateOpts{
+		ServerID:   serverId,
+		FloatingIP: floatingIP,
+		FixedIP:    fixedIP,
+	}
+
+	log.Printf("[DEBUG] Attemping to associate %s to %s", floatingIP, serverId)
+	if err := floatingip.Associate(computeClient, associateOpts).ExtractErr(); err != nil {
+		return fmt.Errorf("Error associating floating IP: %s", err)
+	}
+
+	return nil
+}
+
+func disassociateFloatingIP(computeClient *gophercloud.ServiceClient, serverId, floatingIP string) error {
+	log.Printf("[DEBUG] Attemping to disassociate %s from %s", floatingIP, serverId)
+	associateOpts := floatingip.AssociateOpts{
+		ServerID:   serverId,
+		FloatingIP: floatingIP,
+	}
+	if err := floatingip.Disassociate(computeClient, associateOpts).ExtractErr(); err != nil {
+		return fmt.Errorf("Error disassociating Floating IP during update: %s", err)
+	}
+
+	return nil
+}
 func resourceInstanceMetadataV2(d *schema.ResourceData) map[string]string {
 	m := make(map[string]string)
 	for key, val := range d.Get("metadata").(map[string]interface{}) {
