@@ -774,7 +774,7 @@ func updateNetworkDetails(computeClient *gophercloud.ServiceClient, d *schema.Re
 	// Loop through all networks and addresses,
 	// merge relevant address details.
 	if len(networkDetails) == 0 {
-		for _, n := range addresses {
+		for netName, n := range addresses {
 			if floatingIP, ok := n["floating_ip"]; ok {
 				hostv4 = floatingIP.(string)
 			} else {
@@ -788,7 +788,7 @@ func updateNetworkDetails(computeClient *gophercloud.ServiceClient, d *schema.Re
 			}
 
 			networks[0] = map[string]interface{}{
-				"name":        n,
+				"name":        netName,
 				"fixed_ip_v4": n["fixed_ip_v4"],
 				"fixed_ip_v6": n["fixed_ip_v6"],
 				"mac":         n["mac"],
