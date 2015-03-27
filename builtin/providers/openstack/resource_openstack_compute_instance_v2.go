@@ -76,7 +76,7 @@ func resourceComputeInstanceV2() *schema.Resource {
 				Optional: true,
 				ForceNew: false,
 			},
-                        "user_data": &schema.Schema{
+			"user_data": &schema.Schema{
 				Type:     schema.TypeString,
 				Optional: true,
 				ForceNew: true,
